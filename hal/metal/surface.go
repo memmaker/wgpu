@@ -92,7 +92,13 @@ func (s *Surface) Configure(device hal.Device, config *hal.SurfaceConfiguration)
 	// Set maximum drawable count for frame latency control.
 	// Rust wgpu: set_maximum_drawable_count(maximum_frame_latency + 1).
 	// Default maximum_frame_latency=2 → drawable_count=3 (Metal default).
-	_ = MsgSend(s.layer, Sel("setMaximumDrawableCount:"), uintptr(3))
+	// Without display sync, 3 drawables still pace nextDrawable to the
+	// display refresh in a window (M5, macOS 26: ~65 fps with 3, ~400 with 2).
+	drawables := uintptr(3)
+	if config.PresentMode != hal.PresentModeFifo {
+		drawables = 2
+	}
+	_ = MsgSend(s.layer, Sel("setMaximumDrawableCount:"), drawables)
 
 	// Disable the 1-second timeout on nextDrawable (Rio/zed/ghostty pattern).
 	// With the timeout enabled, nextDrawable returns nil under drawable-pool
