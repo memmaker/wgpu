@@ -898,6 +898,7 @@ func (d *Device) CreateRenderPipeline(desc *hal.RenderPipelineDescriptor) (hal.R
 		device:        d,
 		layout:        pipeLayout,
 		cullMode:      cullModeToMTL(desc.Primitive.CullMode),
+		primitive:     primitiveTopologyToMTL(desc.Primitive.Topology),
 		frontFace:     frontFaceToMTL(desc.Primitive.FrontFace),
 		icbCompatible: icbCompatible,
 

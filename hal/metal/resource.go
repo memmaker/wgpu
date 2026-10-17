@@ -217,6 +217,7 @@ type RenderPipeline struct {
 	device        *Device
 	layout        *PipelineLayout // for SetBindGroup slot offset lookup
 	cullMode      MTLCullMode
+	primitive     MTLPrimitiveType
 	frontFace     MTLWinding
 	icbCompatible bool
 
