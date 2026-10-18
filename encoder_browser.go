@@ -5,6 +5,7 @@ package wgpu
 import (
 	"syscall/js"
 
+	"github.com/gogpu/gputypes"
 	"github.com/gogpu/wgpu/internal/browser"
 )
 
@@ -214,6 +215,9 @@ func buildRenderPassDescriptorJS(desc *RenderPassDescriptor) js.Value {
 			StencilStoreOp:    browser.StoreOpToJS(dsa.StencilStoreOp),
 			StencilClearValue: dsa.StencilClearValue,
 			StencilReadOnly:   dsa.StencilReadOnly,
+		}
+		if dsa.StencilLoadOp == gputypes.LoadOpUndefined { // a depth-only format: WebGPU refuses stencil ops
+			ds.StencilLoadOp, ds.StencilStoreOp = "", ""
 		}
 		if dsa.View != nil && dsa.View.browser != nil {
 			ds.View = dsa.View.browser.Ref()

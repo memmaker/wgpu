@@ -745,7 +745,7 @@ type RenderPassDepthStencilAttachmentJS struct {
 	DepthStoreOp      string   // "store" or "discard"
 	DepthClearValue   float32
 	DepthReadOnly     bool
-	StencilLoadOp     string // "load" or "clear"
+	StencilLoadOp     string // "load" or "clear"; "" leaves the stencil ops out (depth-only formats)
 	StencilStoreOp    string // "store" or "discard"
 	StencilClearValue uint32
 	StencilReadOnly   bool
@@ -805,7 +805,7 @@ func BuildRenderPassDescriptor(
 		}
 		ds.Set("depthReadOnly", depthStencil.DepthReadOnly)
 
-		if !depthStencil.StencilReadOnly {
+		if !depthStencil.StencilReadOnly && depthStencil.StencilLoadOp != "" {
 			ds.Set("stencilLoadOp", depthStencil.StencilLoadOp)
 			ds.Set("stencilStoreOp", depthStencil.StencilStoreOp)
 			if depthStencil.StencilLoadOp == "clear" {
