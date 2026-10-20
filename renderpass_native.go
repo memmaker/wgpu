@@ -216,17 +216,9 @@ func (p *RenderPassEncoder) Draw(args gputypes.DrawArgs) {
 	if !p.validateDrawState("Draw") {
 		return
 	}
-	// VAL-C3: firstInstance != 0 requires FeatureIndirectFirstInstance.
-	if args.FirstInstance != 0 {
-		if err := core.RequireFeature(
-			p.encoder.device.Features(),
-			gputypes.FeatureIndirectFirstInstance,
-			"Draw",
-		); err != nil {
-			p.encoder.setError(err)
-			return
-		}
-	}
+	// A direct draw's firstInstance needs no feature: WebGPU's indirect-first-instance
+	// covers only the firstInstance read from an indirect buffer (the GL backend does not
+	// pass it on yet).
 	p.core.Draw(args)
 }
 
@@ -248,17 +240,7 @@ func (p *RenderPassEncoder) DrawIndexed(args gputypes.DrawIndexedArgs) {
 			p.indexBufferFormat, *p.currentStripIndexFormat, ErrDrawIndexFormatMismatch))
 		return
 	}
-	// VAL-C3: firstInstance != 0 requires FeatureIndirectFirstInstance.
-	if args.FirstInstance != 0 {
-		if err := core.RequireFeature(
-			p.encoder.device.Features(),
-			gputypes.FeatureIndirectFirstInstance,
-			"DrawIndexed",
-		); err != nil {
-			p.encoder.setError(err)
-			return
-		}
-	}
+	// Direct draw: firstInstance needs no feature (see Draw).
 	p.core.DrawIndexed(args)
 }
 

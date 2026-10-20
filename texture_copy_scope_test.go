@@ -270,16 +270,6 @@ func TestCopyUsageConflictsAreAtomic(t *testing.T) {
 		wantBuffer track.BufferUses
 	}{
 		{
-			name: "texture to buffer texture conflict leaves buffer untouched",
-			seed: func(t *testing.T, enc *CommandEncoder, src, _ *Texture, _ *Buffer) {
-				mustSetTextureScopeUsage(t, enc, src, track.TextureUsesCopyDst)
-			},
-			record: func(enc *CommandEncoder, src, _ *Texture, buffer *Buffer) {
-				enc.CopyTextureToBuffer(src, buffer, nil)
-			},
-			wantSrc: track.TextureUsesCopyDst,
-		},
-		{
 			name: "texture to buffer buffer conflict leaves texture untouched",
 			seed: func(t *testing.T, enc *CommandEncoder, _, _ *Texture, buffer *Buffer) {
 				mustSetBufferScopeUsage(t, enc, buffer, track.BufferUsesCopySrc)
@@ -290,16 +280,6 @@ func TestCopyUsageConflictsAreAtomic(t *testing.T) {
 			wantBuffer: track.BufferUsesCopySrc,
 		},
 		{
-			name: "buffer to texture texture conflict leaves buffer untouched",
-			seed: func(t *testing.T, enc *CommandEncoder, _, dst *Texture, _ *Buffer) {
-				mustSetTextureScopeUsage(t, enc, dst, track.TextureUsesCopySrc)
-			},
-			record: func(enc *CommandEncoder, _, dst *Texture, buffer *Buffer) {
-				enc.CopyBufferToTexture(buffer, dst, nil)
-			},
-			wantDst: track.TextureUsesCopySrc,
-		},
-		{
 			name: "buffer to texture buffer conflict leaves texture untouched",
 			seed: func(t *testing.T, enc *CommandEncoder, _, _ *Texture, buffer *Buffer) {
 				mustSetBufferScopeUsage(t, enc, buffer, track.BufferUsesCopyDst)
@@ -308,26 +288,6 @@ func TestCopyUsageConflictsAreAtomic(t *testing.T) {
 				enc.CopyBufferToTexture(buffer, dst, nil)
 			},
 			wantBuffer: track.BufferUsesCopyDst,
-		},
-		{
-			name: "texture to texture source conflict leaves destination untouched",
-			seed: func(t *testing.T, enc *CommandEncoder, src, _ *Texture, _ *Buffer) {
-				mustSetTextureScopeUsage(t, enc, src, track.TextureUsesCopyDst)
-			},
-			record: func(enc *CommandEncoder, src, dst *Texture, _ *Buffer) {
-				enc.CopyTextureToTexture(src, dst, nil)
-			},
-			wantSrc: track.TextureUsesCopyDst,
-		},
-		{
-			name: "texture to texture destination conflict leaves source untouched",
-			seed: func(t *testing.T, enc *CommandEncoder, _, dst *Texture, _ *Buffer) {
-				mustSetTextureScopeUsage(t, enc, dst, track.TextureUsesCopySrc)
-			},
-			record: func(enc *CommandEncoder, src, dst *Texture, _ *Buffer) {
-				enc.CopyTextureToTexture(src, dst, nil)
-			},
-			wantDst: track.TextureUsesCopySrc,
 		},
 		{
 			name: "texture to texture same endpoint conflict leaves scope untouched",
@@ -383,6 +343,42 @@ func TestCopyUsageConflictsAreAtomic(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Each copy is a usage scope of its own: a texture copied into and then out of in
+// one command buffer moves from CopyDst to CopySrc with a barrier between them.
+func TestCopiesAreSeparateUsageScopes(t *testing.T) {
+	t.Parallel()
+
+	_, _, device := newTestDeviceWithTracker(t)
+	defer device.Release()
+	tex := createCopyScopeTexture(t, device, "scopes-tex", TextureUsageCopySrc|TextureUsageCopyDst)
+	defer tex.Release()
+	in := createCopyScopeBuffer(t, device, "scopes-in")
+	defer in.Release()
+	out := createCopyScopeBuffer(t, device, "scopes-out")
+	defer out.Release()
+
+	enc, err := device.CreateCommandEncoder(nil)
+	if err != nil {
+		t.Fatalf("CreateCommandEncoder: %v", err)
+	}
+	enc.CopyBufferToTexture(in, tex, nil)
+	enc.CopyTextureToBuffer(tex, out, nil)
+
+	scope := enc.core.Mutable().TextureScope()
+	index := tex.coreTexture.TrackingData().Index()
+	if got := scope.GetUsage(index); got != track.TextureUsesCopyDst {
+		t.Errorf("start usage = %v, want CopyDst", got)
+	}
+	if got := scope.EndUsage(index); got != track.TextureUsesCopySrc {
+		t.Errorf("end usage = %v, want CopySrc", got)
+	}
+	cb, err := enc.Finish()
+	if err != nil {
+		t.Fatalf("Finish: %v", err)
+	}
+	cb.Release()
 }
 
 func TestCopyBufferToBufferUsageRecordingIsAtomic(t *testing.T) {

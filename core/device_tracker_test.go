@@ -839,23 +839,56 @@ func TestBeginRenderPass_TextureConflict_Error(t *testing.T) {
 		t.Fatalf("CreateCommandEncoder: %v", err)
 	}
 
-	// Set up a scope conflict: try to use the same texture as COLOR_TARGET
-	// through two different color attachments, which is actually allowed
-	// (same exclusive usage). So instead, manually set up the scope first.
-	// First, mark the texture as RESOURCE in the scope.
-	enc.RecordBufferUsage(nil, 0) // no-op, just to access mutable
-	_ = enc.Mutable().TextureScope().SetUsage(td.Index(), track.TextureUsesResource)
-
-	// Now BeginRenderPass tries to add COLOR_TARGET to the same texture.
-	// This should produce a conflict error (RESOURCE + COLOR_TARGET).
+	// The same texture as a color attachment and the depth/stencil attachment
+	// of one pass: COLOR_TARGET + DEPTH_STENCIL_WRITE conflict within the pass.
 	desc := &RenderPassDescriptor{
 		ColorAttachments: []RenderPassColorAttachment{
 			{View: view, LoadOp: gputypes.LoadOpClear, StoreOp: gputypes.StoreOpStore},
 		},
+		DepthStencilAttachment: &RenderPassDepthStencilAttachment{View: view},
 	}
 	_, passErr := enc.BeginRenderPass(desc)
 	if passErr == nil {
 		t.Fatal("Expected texture usage conflict error, got nil")
+	}
+}
+
+// TestBeginRenderPass_AfterOtherUsage verifies that a render pass is a usage
+// scope of its own: a texture an earlier scope of the command buffer used as
+// RESOURCE becomes the pass's COLOR_TARGET (with a barrier), and the command
+// buffer still starts it as RESOURCE.
+func TestBeginRenderPass_AfterOtherUsage(t *testing.T) {
+	t.Parallel()
+
+	halDevice := &mockHALDevice{}
+	device := NewDevice(halDevice, &Adapter{}, gputypes.Features(0), gputypes.DefaultLimits(), "TestDevice")
+	td := track.NewTrackingData(device.TrackerIndices().Textures())
+	tex := &Texture{raw: NewSnatchable[hal.Texture](nil), device: device, trackingData: td}
+	view := &TextureView{Parent: tex}
+
+	enc, err := device.CreateCommandEncoder("test")
+	if err != nil {
+		t.Fatalf("CreateCommandEncoder: %v", err)
+	}
+	scope := enc.Mutable().TextureScope()
+	_ = scope.SetUsage(td.Index(), track.TextureUsesResource)
+
+	pass, err := enc.BeginRenderPass(&RenderPassDescriptor{
+		ColorAttachments: []RenderPassColorAttachment{
+			{View: view, LoadOp: gputypes.LoadOpClear, StoreOp: gputypes.StoreOpStore},
+		},
+	})
+	if err != nil {
+		t.Fatalf("BeginRenderPass: %v", err)
+	}
+	if err := pass.End(); err != nil {
+		t.Fatalf("End: %v", err)
+	}
+	if got := scope.GetUsage(td.Index()); got != track.TextureUsesResource {
+		t.Errorf("start usage = %v, want RESOURCE", got)
+	}
+	if got := scope.EndUsage(td.Index()); got != track.TextureUsesColorTarget {
+		t.Errorf("end usage = %v, want COLOR_TARGET", got)
 	}
 }
 

@@ -432,22 +432,23 @@ func (e *CoreCommandEncoder) BeginRenderPass(desc *RenderPassDescriptor) (*CoreR
 		return nil, err
 	}
 
-	// Begin HAL render pass
-	halPass := (*halEncoder).BeginRenderPass(halDesc)
-
-	// Populate textureScope from render pass attachments.
-	// Each color attachment is tracked as COLOR_TARGET, depth/stencil as
-	// DEPTH_STENCIL_WRITE (or DEPTH_STENCIL_READ if both aspects read-only),
-	// and resolve targets as COLOR_TARGET.
+	// Track the render pass attachments: each color attachment as COLOR_TARGET,
+	// depth/stencil as DEPTH_STENCIL_WRITE (or DEPTH_STENCIL_READ if both
+	// aspects read-only), and resolve targets as COLOR_TARGET. The pass is a
+	// usage scope of its own: barriers from the textures' earlier states in
+	// this command buffer are recorded before it begins.
 	//
 	// WebGPU spec: usage conflict (e.g. COLOR_TARGET + RESOURCE on same texture)
 	// is a validation error that should prevent the render pass from being used.
 	//
 	// Reference: wgpu-core command/render.rs RenderPassInfo::finish (scope merge)
-	if conflictErr := e.populateTextureScope(desc); conflictErr != nil {
+	if conflictErr := e.populateTextureScope(desc, *halEncoder, guard); conflictErr != nil {
 		e.setError(conflictErr)
 		return nil, conflictErr
 	}
+
+	// Begin HAL render pass
+	halPass := (*halEncoder).BeginRenderPass(halDesc)
 
 	// Transition to locked state
 	e.status.Store(int32(CommandEncoderStatusLocked))
@@ -953,8 +954,9 @@ func (e *CoreCommandEncoder) convertRenderPassDescriptor(desc *RenderPassDescrip
 }
 
 // populateTextureScope records texture usage from the render pass descriptor
-// into the command buffer's textureScope. Each attachment's parent texture
-// is tracked with the appropriate usage flags for submit-time barrier generation.
+// into the command buffer's textureScope and records, into raw, the barriers
+// that move each attachment from its earlier state in this command buffer to
+// the pass's. A texture new to the command buffer gets its barrier at submit.
 //
 // This mirrors Rust wgpu-core's RenderPassInfo::finish() which calls
 // scope.textures.merge_single(texture, selector, usage) for each render attachment.
@@ -965,18 +967,21 @@ func (e *CoreCommandEncoder) convertRenderPassDescriptor(desc *RenderPassDescrip
 // and any other usage in the same render pass."
 //
 // Reference: wgpu-core command/render.rs RenderPassInfo::check_valid
-func (e *CoreCommandEncoder) populateTextureScope(desc *RenderPassDescriptor) error {
+func (e *CoreCommandEncoder) populateTextureScope(desc *RenderPassDescriptor, raw hal.CommandEncoder, guard SnatchGuard) error {
 	if e.mutable == nil || e.mutable.textureScope == nil || desc == nil {
 		return nil
 	}
 
+	// The pass's own usage scope: its attachments must not conflict.
+	pass := passTextures{scope: track.NewTextureUsageScope()}
+
 	// Track color attachments and their resolve targets as COLOR_TARGET.
 	for i := range desc.ColorAttachments {
 		ca := &desc.ColorAttachments[i]
-		if err := trackViewUsage(e.mutable.textureScope, ca.View, track.TextureUsesColorTarget); err != nil {
+		if err := pass.trackView(ca.View, track.TextureUsesColorTarget); err != nil {
 			return fmt.Errorf("color attachment %d: %w", i, err)
 		}
-		if err := trackViewUsage(e.mutable.textureScope, ca.ResolveTarget, track.TextureUsesColorTarget); err != nil {
+		if err := pass.trackView(ca.ResolveTarget, track.TextureUsesColorTarget); err != nil {
 			return fmt.Errorf("resolve target %d: %w", i, err)
 		}
 	}
@@ -984,18 +989,37 @@ func (e *CoreCommandEncoder) populateTextureScope(desc *RenderPassDescriptor) er
 	// Track depth/stencil attachment.
 	if desc.DepthStencilAttachment != nil {
 		usage := depthStencilUsage(desc.DepthStencilAttachment)
-		if err := trackViewUsage(e.mutable.textureScope, desc.DepthStencilAttachment.View, usage); err != nil {
+		if err := pass.trackView(desc.DepthStencilAttachment.View, usage); err != nil {
 			return fmt.Errorf("depth/stencil attachment: %w", err)
 		}
 	}
 
+	var barriers []hal.TextureBarrier
+	for _, tex := range pass.textures {
+		index := tex.TrackingData().Index()
+		t, ok := e.mutable.textureScope.Transition(index, pass.scope.GetUsage(index))
+		if !ok {
+			continue
+		}
+		if halTex := tex.Raw(guard); halTex != nil {
+			barriers = append(barriers, t.IntoHAL(halTex))
+		}
+	}
+	if len(barriers) > 0 && raw != nil {
+		raw.TransitionTextures(barriers)
+	}
 	return nil
 }
 
-// trackViewUsage records a texture view's parent texture in the given scope
-// with the specified usage. Returns nil if the view is nil, has no parent,
-// or has no valid tracker index.
-func trackViewUsage(scope *track.TextureUsageScope, view *TextureView, usage track.TextureUses) error {
+// passTextures is a render pass's usage scope and its textures, in order.
+type passTextures struct {
+	scope    *track.TextureUsageScope
+	textures []*Texture
+}
+
+// trackView records a texture view's parent texture with the specified usage.
+// Returns nil if the view is nil, has no parent, or has no valid tracker index.
+func (p *passTextures) trackView(view *TextureView, usage track.TextureUses) error {
 	if view == nil || view.Parent == nil {
 		return nil
 	}
@@ -1003,7 +1027,10 @@ func trackViewUsage(scope *track.TextureUsageScope, view *TextureView, usage tra
 	if td == nil || !td.Index().IsValid() {
 		return nil
 	}
-	return scope.SetUsage(td.Index(), usage)
+	if !p.scope.IsUsed(td.Index()) {
+		p.textures = append(p.textures, view.Parent)
+	}
+	return p.scope.SetUsage(td.Index(), usage)
 }
 
 // depthStencilUsage returns the appropriate texture usage for a depth/stencil

@@ -645,3 +645,30 @@ func BenchmarkTextureTracker_Merge(b *testing.B) {
 		_ = tracker.Merge(scope)
 	}
 }
+
+// A command buffer that renders to a texture and then copies from it starts it as
+// a color target, records its own barrier to CopySrc, and leaves the device
+// tracker at CopySrc.
+func TestTextureUsageScope_TransitionAndMerge(t *testing.T) {
+	scope := NewTextureUsageScope()
+	if _, ok := scope.Transition(3, TextureUsesColorTarget); ok {
+		t.Fatal("first use needs no in-buffer barrier")
+	}
+	tr, ok := scope.Transition(3, TextureUsesCopySrc)
+	if !ok || tr.Usage.From != TextureUsesColorTarget || tr.Usage.To != TextureUsesCopySrc {
+		t.Fatalf("transition = %+v, %v; want ColorTarget -> CopySrc", tr, ok)
+	}
+	if _, ok := scope.Transition(3, TextureUsesCopySrc); ok {
+		t.Fatal("same ordered state needs no barrier")
+	}
+
+	tracker := NewTextureTracker()
+	tracker.InsertSingle(3, TextureUsesResource)
+	pending := tracker.Merge(scope)
+	if len(pending) != 1 || pending[0].Usage.From != TextureUsesResource || pending[0].Usage.To != TextureUsesColorTarget {
+		t.Fatalf("submit transitions = %+v, want Resource -> ColorTarget", pending)
+	}
+	if got := tracker.GetUsage(3); got != TextureUsesCopySrc {
+		t.Fatalf("device state after merge = %v, want CopySrc", got)
+	}
+}

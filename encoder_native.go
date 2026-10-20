@@ -42,12 +42,6 @@ type CommandEncoder struct {
 	// destroyed state.
 	usedTextures map[*Texture]struct{}
 
-	// explicitTextureTransitions records the most recent explicit transition
-	// for each texture. When a following command uses that exact state, its
-	// usage replaces (rather than conflicts with) the pre-transition scope
-	// state because the caller already encoded the intervening barrier.
-	explicitTextureTransitions map[*Texture]gputypes.TextureUsage
-
 	// usedBindGroups tracks bind groups referenced during encoding for
 	// submit-time validation (VAL-B5). At Submit, each bind group is checked
 	// for destroyed state. Matches Rust wgpu-core's cmd_buf_data.trackers.bind_groups
@@ -191,9 +185,12 @@ func (e *CommandEncoder) recordCopyBufferUsages(requests []copyBufferUsage) bool
 	return true
 }
 
-// recordCopyUsages preflights every resource scope update before committing any
+// recordCopyUsages validates every resource scope update before committing any
 // of them. Copy commands span multiple independently tracked resources, so a
 // conflict on one endpoint must not leave another endpoint recorded.
+//
+// A copy is a usage scope of its own: a texture an earlier pass or copy of this
+// command buffer used otherwise gets a barrier into the copy's state first.
 func (e *CommandEncoder) recordCopyUsages(textures []copyTextureUsage, buffer *core.Buffer, bufferUsage track.BufferUses) bool {
 	if e.core == nil {
 		return true
@@ -203,21 +200,29 @@ func (e *CommandEncoder) recordCopyUsages(textures []copyTextureUsage, buffer *c
 		e.setError(fmt.Errorf("wgpu: texture usage conflict: %w", err))
 		return false
 	}
-	if err := e.preflightCopyTextureUsages(prepared); err != nil {
-		e.setError(fmt.Errorf("wgpu: texture usage conflict: %w", err))
-		return false
-	}
 	bufferIndex, finalBufferUsage, trackedBuffer, err := e.preflightCopyBufferUsage(buffer, bufferUsage)
 	if err != nil {
 		e.setError(fmt.Errorf("wgpu: buffer usage conflict: %w", err))
 		return false
 	}
 
-	// All validation is complete. ReplaceUsage cannot fail, so the commit has no
-	// partial-failure path after the first scope mutation.
+	// All validation is complete. Transition and ReplaceUsage cannot fail, so
+	// the commit has no partial-failure path after the first scope mutation.
 	textureScope := e.core.Mutable().TextureScope()
+	var barriers []hal.TextureBarrier
 	for _, request := range prepared {
-		textureScope.ReplaceUsage(request.index, request.usage)
+		t, ok := textureScope.Transition(request.index, request.usage)
+		if !ok {
+			continue
+		}
+		if halTex := request.texture.resolveHAL(); halTex != nil {
+			barriers = append(barriers, t.IntoHAL(halTex))
+		}
+	}
+	if len(barriers) > 0 {
+		if raw := e.core.RawEncoder(); raw != nil {
+			raw.TransitionTextures(barriers)
+		}
 	}
 	if trackedBuffer {
 		e.core.Mutable().BufferScope().ReplaceUsage(bufferIndex, finalBufferUsage)
@@ -257,30 +262,6 @@ func prepareCopyTextureUsages(requests []copyTextureUsage) ([]preparedCopyTextur
 		prepared[position].usage = combined
 	}
 	return prepared, nil
-}
-
-func (e *CommandEncoder) preflightCopyTextureUsages(requests []preparedCopyTextureUsage) error {
-	scope := e.core.Mutable().TextureScope()
-	for i := range requests {
-		request := &requests[i]
-		if !scope.IsUsed(request.index) {
-			continue
-		}
-		existing := scope.GetUsage(request.index)
-		combined := existing | request.usage
-		if combined.IsCompatible(combined) {
-			request.usage = combined
-			continue
-		}
-		if transitioned, ok := e.explicitTextureTransitions[request.texture]; ok &&
-			transitioned == request.usage.ToTextureUsage() {
-			continue
-		}
-		return &track.TextureUsageConflictError{
-			Index: request.index, Existing: existing, New: request.usage,
-		}
-	}
-	return nil
 }
 
 func (e *CommandEncoder) preflightCopyBufferUsage(buffer *core.Buffer, usage track.BufferUses) (track.TrackerIndex, track.BufferUses, bool, error) {
@@ -517,13 +498,47 @@ func (e *CommandEncoder) TransitionTextures(barriers []TextureBarrier) {
 	}
 	if len(halBarriers) > 0 {
 		raw.TransitionTextures(halBarriers)
-		if e.explicitTextureTransitions == nil {
-			e.explicitTextureTransitions = make(map[*Texture]gputypes.TextureUsage)
-		}
+		// The textures are in the new states from here on: the next pass or copy
+		// starts its barriers there.
+		scope := e.core.Mutable().TextureScope()
 		for _, b := range validBarriers {
-			e.explicitTextureTransitions[b.Texture] = b.Usage.NewUsage
+			if b.Texture.coreTexture == nil {
+				continue
+			}
+			td := b.Texture.coreTexture.TrackingData()
+			if td == nil || !td.Index().IsValid() {
+				continue
+			}
+			f := b.Texture.Format()
+			scope.SetEnd(td.Index(), textureUses(b.Usage.OldUsage, f), textureUses(b.Usage.NewUsage, f))
 		}
 	}
+}
+
+// textureUses is the tracker's state for a public texture usage of a texture
+// of format f (an attachment is a color target or a depth/stencil one).
+func textureUses(u gputypes.TextureUsage, f gputypes.TextureFormat) track.TextureUses {
+	var uses track.TextureUses
+	if u&gputypes.TextureUsageCopySrc != 0 {
+		uses |= track.TextureUsesCopySrc
+	}
+	if u&gputypes.TextureUsageCopyDst != 0 {
+		uses |= track.TextureUsesCopyDst
+	}
+	if u&gputypes.TextureUsageTextureBinding != 0 {
+		uses |= track.TextureUsesResource
+	}
+	if u&gputypes.TextureUsageStorageBinding != 0 {
+		uses |= track.TextureUsesStorageRead | track.TextureUsesStorageWrite
+	}
+	if u&gputypes.TextureUsageRenderAttachment != 0 {
+		if f.IsDepthStencil() {
+			uses |= track.TextureUsesDepthStencilWrite
+		} else {
+			uses |= track.TextureUsesColorTarget
+		}
+	}
+	return uses
 }
 
 // CopyBufferToTexture copies data from a buffer to a texture.

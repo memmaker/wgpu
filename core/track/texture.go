@@ -142,8 +142,13 @@ func (u TextureUses) ToTextureUsage() gputypes.TextureUsage {
 }
 
 // TextureState holds the tracked state for a single texture.
+//
+// In a command buffer's scope, usage is the state the buffer needs the texture
+// in at its start, and end the state its last command leaves it in (they differ
+// when the buffer's own barriers move the texture between usage scopes).
 type TextureState struct {
 	usage TextureUses
+	end   TextureUses
 }
 
 // Usage returns the current usage.
@@ -239,28 +244,28 @@ func (t *TextureTracker) Merge(scope *TextureUsageScope) []TexturePendingTransit
 		}
 
 		newUsage := scope.states[i].usage
+		endUsage := scope.EndUsage(index)
 		oldUsage := t.GetUsage(index)
 
 		// If texture not tracked in device, add it
 		if !t.IsTracked(index) {
-			t.InsertSingle(index, newUsage)
+			t.InsertSingle(index, endUsage)
 			continue
 		}
 
 		// Check if transition is needed using the skip_barrier rule
-		if SkipBarrier(oldUsage, newUsage) {
-			continue
+		if !SkipBarrier(oldUsage, newUsage) {
+			// State changed or not all ordered — emit a barrier
+			transitions = append(transitions, TexturePendingTransition{
+				Index: index,
+				Usage: TextureStateTransition{
+					From: oldUsage,
+					To:   newUsage,
+				},
+			})
 		}
-
-		// State changed or not all ordered — emit a barrier
-		transitions = append(transitions, TexturePendingTransition{
-			Index: index,
-			Usage: TextureStateTransition{
-				From: oldUsage,
-				To:   newUsage,
-			},
-		})
-		t.states[index].usage = newUsage
+		// The command buffer leaves the texture in its end state.
+		t.states[index].usage = endUsage
 	}
 
 	return transitions
@@ -303,8 +308,9 @@ func (s *TextureUsageScope) SetUsage(index TrackerIndex, usage TextureUses) erro
 		}
 		// Merge usages if compatible
 		s.states[index].usage = combined
+		s.states[index].end = combined
 	} else {
-		s.states[index] = TextureState{usage: usage}
+		s.states[index] = TextureState{usage: usage, end: usage}
 		s.metadata.SetOwned(index, true)
 	}
 
@@ -312,12 +318,53 @@ func (s *TextureUsageScope) SetUsage(index TrackerIndex, usage TextureUses) erro
 }
 
 // ReplaceUsage unconditionally replaces the usage recorded for a texture. It
-// is intended only after preflight validation, or after an explicit transition
-// where the scope must describe the state after the encoded barrier.
+// is intended only after preflight validation.
 func (s *TextureUsageScope) ReplaceUsage(index TrackerIndex, usage TextureUses) {
 	s.ensureSize(int(index) + 1)
-	s.states[index] = TextureState{usage: usage}
+	s.states[index] = TextureState{usage: usage, end: usage}
 	s.metadata.SetOwned(index, true)
+}
+
+// Transition records that the next usage scope of a command buffer (a render
+// pass, a compute pass or a copy) uses the texture as usage. A texture new to
+// the buffer starts in usage; otherwise, when its state changes, the returned
+// transition is the barrier the buffer must record before that usage scope.
+// Usage scopes are separate in WebGPU: one may write a texture another reads.
+//
+// Reference: wgpu-core track/texture.rs TextureTracker::set_from_usage_scope
+// (the per-command-buffer tracker that drains barriers between passes)
+func (s *TextureUsageScope) Transition(index TrackerIndex, usage TextureUses) (TexturePendingTransition, bool) {
+	s.ensureSize(int(index) + 1)
+	if !s.metadata.IsOwned(index) {
+		s.states[index] = TextureState{usage: usage, end: usage}
+		s.metadata.SetOwned(index, true)
+		return TexturePendingTransition{}, false
+	}
+	old := s.states[index].end
+	if SkipBarrier(old, usage) {
+		return TexturePendingTransition{}, false
+	}
+	s.states[index].end = usage
+	return TexturePendingTransition{Index: index, Usage: TextureStateTransition{From: old, To: usage}}, true
+}
+
+// SetEnd records an explicit transition the caller encoded: the texture is in
+// usage from here on. A texture new to the buffer starts in from.
+func (s *TextureUsageScope) SetEnd(index TrackerIndex, from, usage TextureUses) {
+	s.ensureSize(int(index) + 1)
+	if !s.metadata.IsOwned(index) {
+		s.states[index] = TextureState{usage: from}
+		s.metadata.SetOwned(index, true)
+	}
+	s.states[index].end = usage
+}
+
+// EndUsage returns the state the scope's last command leaves the texture in.
+func (s *TextureUsageScope) EndUsage(index TrackerIndex) TextureUses {
+	if int(index) < len(s.states) && s.metadata.IsOwned(index) {
+		return s.states[index].end
+	}
+	return TextureUsesNone
 }
 
 // GetUsage returns the current usage in this scope.
