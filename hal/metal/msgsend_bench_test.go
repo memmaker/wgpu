@@ -94,3 +94,33 @@ func TestMsgSendArgs(t *testing.T) {
 		t.Fatal("boolValue")
 	}
 }
+
+// BenchmarkBeginEncoding measures creating (and discarding) a command buffer,
+// which every frame does at least twice.
+func BenchmarkBeginEncoding(b *testing.B) {
+	if err := Init(); err != nil {
+		b.Skipf("Init: %v", err)
+	}
+	rawDevice := CreateSystemDefaultDevice()
+	if rawDevice == 0 {
+		b.Skip("no Metal device available")
+	}
+	b.Cleanup(func() { Release(rawDevice) })
+	device, err := newDevice(&Adapter{raw: rawDevice})
+	if err != nil {
+		b.Fatalf("newDevice: %v", err)
+	}
+	b.Cleanup(device.Destroy)
+	for _, label := range []string{"", "frame"} {
+		b.Run("label="+label, func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				e := &CommandEncoder{device: device}
+				if err := e.BeginEncoding(label); err != nil {
+					b.Fatal(err)
+				}
+				e.DiscardEncoding()
+			}
+		})
+	}
+}
