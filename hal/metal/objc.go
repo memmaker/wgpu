@@ -7,6 +7,7 @@ package metal
 
 import (
 	"fmt"
+	"math"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -32,14 +33,23 @@ var (
 	cifSetBytes    types.CallInterface
 )
 
-// selectorCache caches registered selectors for performance.
-var selectorCache sync.Map
+// selectors caches registered selectors: a copy-on-write map, so a lookup
+// takes no lock and allocates nothing (a sync.Map boxes the string key).
+var (
+	selectors   atomic.Pointer[map[string]SEL]
+	selectorsMu sync.Mutex // serialises inserts
+)
 
+// objcArg is one argument of an Objective-C call, its value held inline so
+// building it allocates nothing.
 type objcArg struct {
-	typ       *types.TypeDescriptor
-	ptr       unsafe.Pointer
-	keepAlive any
+	typ *types.TypeDescriptor
+	val [objcArgWords]uint64
 }
+
+// objcArgWords is the largest argument value in 64-bit words
+// (MTLViewport and MTLRegion: six).
+const objcArgWords = 6
 
 var (
 	cgSizeType = &types.TypeDescriptor{
@@ -189,8 +199,10 @@ func GetClass(name string) Class {
 
 // RegisterSelector registers and returns a selector for the given name.
 func RegisterSelector(name string) SEL {
-	if cached, ok := selectorCache.Load(name); ok {
-		return cached.(SEL)
+	if m := selectors.Load(); m != nil {
+		if sel, ok := (*m)[name]; ok {
+			return sel
+		}
 	}
 
 	cname := append([]byte(name), 0)
@@ -200,8 +212,23 @@ func RegisterSelector(name string) SEL {
 	args := [1]unsafe.Pointer{unsafe.Pointer(&ptr)}
 	_, _ = ffi.CallFunction(&cifSelRegister, symSelRegisterName, unsafe.Pointer(&result), args[:])
 
-	selectorCache.Store(name, result)
+	selectorsMu.Lock()
+	old := selectors.Load()
+	m := make(map[string]SEL, 1+len(mapOrEmpty(old)))
+	for k, v := range mapOrEmpty(old) {
+		m[k] = v
+	}
+	m[name] = result
+	selectors.Store(&m)
+	selectorsMu.Unlock()
 	return result
+}
+
+func mapOrEmpty(m *map[string]SEL) map[string]SEL {
+	if m == nil {
+		return nil
+	}
+	return *m
 }
 
 // Sel is a convenience alias for RegisterSelector.
@@ -210,75 +237,196 @@ func Sel(name string) SEL {
 }
 
 func argPointer(val uintptr) objcArg {
-	v := val
-	return objcArg{typ: types.PointerTypeDescriptor, ptr: unsafe.Pointer(&v), keepAlive: &v}
+	a := objcArg{typ: types.PointerTypeDescriptor}
+	a.val[0] = uint64(val)
+	return a
 }
 
 func argUint64(val uint64) objcArg {
-	v := val
-	return objcArg{typ: types.UInt64TypeDescriptor, ptr: unsafe.Pointer(&v), keepAlive: &v}
+	a := objcArg{typ: types.UInt64TypeDescriptor}
+	a.val[0] = val
+	return a
 }
 
 func argBool(val bool) objcArg {
-	var v uint8
+	a := objcArg{typ: types.UInt8TypeDescriptor}
 	if val {
-		v = 1
+		a.val[0] = 1
 	}
-	return objcArg{typ: types.UInt8TypeDescriptor, ptr: unsafe.Pointer(&v), keepAlive: &v}
+	return a
 }
 
 func argFloat32(val float32) objcArg {
-	v := val
-	return objcArg{typ: types.FloatTypeDescriptor, ptr: unsafe.Pointer(&v), keepAlive: &v}
+	a := objcArg{typ: types.FloatTypeDescriptor}
+	a.val[0] = uint64(math.Float32bits(val))
+	return a
 }
 
 func argFloat64(val float64) objcArg {
-	v := val
-	return objcArg{typ: types.DoubleTypeDescriptor, ptr: unsafe.Pointer(&v), keepAlive: &v}
+	a := objcArg{typ: types.DoubleTypeDescriptor}
+	a.val[0] = math.Float64bits(val)
+	return a
 }
 
 func argStruct[T any](val T, td *types.TypeDescriptor) objcArg {
-	v := val
-	return objcArg{typ: td, ptr: unsafe.Pointer(&v), keepAlive: &v}
+	a := objcArg{typ: td}
+	if unsafe.Sizeof(val) > unsafe.Sizeof(a.val) {
+		panic(fmt.Sprintf("metal: %T argument larger than %d bytes", val, unsafe.Sizeof(a.val)))
+	}
+	*(*T)(unsafe.Pointer(&a.val)) = val
+	return a
 }
 
-func pointerArgs(args []uintptr) []objcArg {
-	out := make([]objcArg, len(args))
-	for i, arg := range args {
-		out[i] = argPointer(arg)
-	}
-	return out
+// maxFrameArgs is the most arguments a pooled call frame takes (after self
+// and _cmd); calls with more take the allocating path.
+const maxFrameArgs = 10
+
+// callFrame holds one call's argument values, the pointers goffi reads them
+// through and the result. goffi's call path makes them escape, so frames
+// are pooled rather than built per call.
+type callFrame struct {
+	self, cmd uintptr
+	args      [maxFrameArgs]objcArg
+	ptrs      [2 + maxFrameArgs]unsafe.Pointer
+	ret       [objcArgWords]uint64
 }
 
-func msgSend(obj ID, sel SEL, retType *types.TypeDescriptor, retPtr unsafe.Pointer, args ...objcArg) error {
-	if obj == 0 || sel == 0 {
-		return nil
-	}
+var framePool = sync.Pool{New: func() any { return new(callFrame) }}
 
+// cifKey identifies a call signature.
+type cifKey struct {
+	ret  *types.TypeDescriptor
+	n    int
+	args [maxFrameArgs]*types.TypeDescriptor
+}
+
+// cifs caches a prepared CallInterface per signature. goffi only reads a
+// prepared CallInterface, so concurrent calls share one.
+var cifs struct {
+	sync.RWMutex
+	m map[cifKey]*types.CallInterface
+}
+
+func cachedCallInterface(retType *types.TypeDescriptor, args []objcArg) (*types.CallInterface, error) {
+	k := cifKey{ret: retType, n: len(args)}
+	for i := range args {
+		k.args[i] = args[i].typ
+	}
+	cifs.RLock()
+	cif := cifs.m[k]
+	cifs.RUnlock()
+	if cif != nil {
+		return cif, nil
+	}
+	cif, err := prepareMsgSend(retType, args)
+	if err != nil {
+		return nil, err
+	}
+	cifs.Lock()
+	if cifs.m == nil {
+		cifs.m = map[cifKey]*types.CallInterface{}
+	}
+	cifs.m[k] = cif
+	cifs.Unlock()
+	return cif, nil
+}
+
+func prepareMsgSend(retType *types.TypeDescriptor, args []objcArg) (*types.CallInterface, error) {
 	argTypes := make([]*types.TypeDescriptor, 2+len(args))
 	argTypes[0] = types.PointerTypeDescriptor
 	argTypes[1] = types.PointerTypeDescriptor
 	for i, arg := range args {
 		argTypes[2+i] = arg.typ
 	}
-
 	cif := &types.CallInterface{}
 	if err := ffi.PrepareCallInterface(cif, types.DefaultCall, retType, argTypes); err != nil {
+		return nil, err
+	}
+	return cif, nil
+}
+
+func pointerArgs(args []uintptr, out *[maxFrameArgs]objcArg) []objcArg {
+	if len(args) > maxFrameArgs {
+		s := make([]objcArg, len(args))
+		for i, arg := range args {
+			s[i] = argPointer(arg)
+		}
+		return s
+	}
+	for i, arg := range args {
+		out[i] = argPointer(arg)
+	}
+	return out[:len(args)]
+}
+
+// msgSend calls objc_msgSend. retPtr receives the result (nil to drop it).
+// It allocates nothing for up to maxFrameArgs arguments.
+func msgSend(obj ID, sel SEL, retType *types.TypeDescriptor, retPtr unsafe.Pointer, args ...objcArg) error {
+	if obj == 0 || sel == 0 {
+		return nil
+	}
+	if len(args) > maxFrameArgs {
+		return msgSendLarge(obj, sel, retType, retPtr, args)
+	}
+	cif, err := cachedCallInterface(retType, args)
+	if err != nil {
 		return err
 	}
+	f := framePool.Get().(*callFrame)
+	f.self, f.cmd = uintptr(obj), uintptr(sel)
+	f.ptrs[0], f.ptrs[1] = unsafe.Pointer(&f.self), unsafe.Pointer(&f.cmd)
+	for i := range args {
+		f.args[i] = args[i]
+		f.ptrs[2+i] = unsafe.Pointer(&f.args[i].val)
+	}
+	// The result goes to the frame and is copied out, so retPtr (usually
+	// the caller's local) never escapes. A struct result returned through
+	// memory (x8 / sret) is written there in place too.
+	// Only a result larger than the frame's buffer gets a buffer of its own.
+	size := typeSize(retType)
+	var rv unsafe.Pointer
+	var big []byte
+	if retPtr != nil {
+		rv = unsafe.Pointer(&f.ret)
+		if size > unsafe.Sizeof(f.ret) {
+			big = make([]byte, size)
+			rv = unsafe.Pointer(&big[0])
+		}
+	}
+	_, err = ffi.CallFunction(cif, objcMsgSendSymbol(retType), rv, f.ptrs[:2+len(args)])
+	if retPtr != nil {
+		copy(unsafe.Slice((*byte)(retPtr), size), unsafe.Slice((*byte)(rv), size))
+	}
+	clear(f.ptrs[:2+len(args)])
+	framePool.Put(f)
+	return err
+}
 
+// msgSendLarge is msgSend for calls with more than maxFrameArgs arguments.
+func msgSendLarge(obj ID, sel SEL, retType *types.TypeDescriptor, retPtr unsafe.Pointer, args []objcArg) error {
+	cif, err := prepareMsgSend(retType, args)
+	if err != nil {
+		return err
+	}
+	vals := append([]objcArg(nil), args...) // copied: args stays on the caller's stack
 	self := uintptr(obj)
 	cmd := uintptr(sel)
-	argPtrs := make([]unsafe.Pointer, 2+len(args))
+	argPtrs := make([]unsafe.Pointer, 2+len(vals))
 	argPtrs[0] = unsafe.Pointer(&self)
 	argPtrs[1] = unsafe.Pointer(&cmd)
-	for i, arg := range args {
-		argPtrs[2+i] = arg.ptr
+	for i := range vals {
+		argPtrs[2+i] = unsafe.Pointer(&vals[i].val)
 	}
-
-	fn := objcMsgSendSymbol(retType)
-	_, err := ffi.CallFunction(cif, fn, retPtr, argPtrs)
-	runtime.KeepAlive(args)
+	var rv unsafe.Pointer
+	size := typeSize(retType)
+	if retPtr != nil {
+		rv = unsafe.Pointer(&make([]byte, max(size, 8))[0])
+	}
+	_, err = ffi.CallFunction(cif, objcMsgSendSymbol(retType), rv, argPtrs)
+	if retPtr != nil {
+		copy(unsafe.Slice((*byte)(retPtr), size), unsafe.Slice((*byte)(rv), size))
+	}
+	runtime.KeepAlive(vals)
 	return err
 }
 
@@ -287,26 +435,8 @@ func msgSendVoid(obj ID, sel SEL, args ...objcArg) {
 }
 
 func msgSendSetBytes(obj ID, sel SEL, bytes unsafe.Pointer, length, index NSUInteger) error {
-	if obj == 0 || sel == 0 {
-		return nil
-	}
-
-	self := uintptr(obj)
-	cmd := uintptr(sel)
-	lengthValue := uint64(length)
-	indexValue := uint64(index)
-	args := [5]unsafe.Pointer{
-		unsafe.Pointer(&self),
-		unsafe.Pointer(&cmd),
-		unsafe.Pointer(&bytes),
-		unsafe.Pointer(&lengthValue),
-		unsafe.Pointer(&indexValue),
-	}
-
-	// Use a per-call copy because goffi requires separate CallInterface
-	// instances for concurrent calls. The prepared type data is immutable.
-	cif := cifSetBytes
-	_, err := ffi.CallFunction(&cif, symObjcMsgSend, nil, args[:])
+	err := msgSend(obj, sel, types.VoidTypeDescriptor, nil,
+		argPointer(uintptr(bytes)), argUint64(uint64(length)), argUint64(uint64(index)))
 	runtime.KeepAlive(bytes)
 	return err
 }
@@ -408,17 +538,20 @@ func alignUp(val, align uintptr) uintptr {
 // for Go↔ObjC bridges without CGO; Rust wgpu-hal/metal uses the same approach
 // via the objc crate's msg_send! macro which also ignores void returns.
 func MsgSend(obj ID, sel SEL, args ...uintptr) ID {
-	return msgSendID(obj, sel, pointerArgs(args)...)
+	var buf [maxFrameArgs]objcArg
+	return msgSendID(obj, sel, pointerArgs(args, &buf)...)
 }
 
 // MsgSendUint calls a method and returns a uint result.
 func MsgSendUint(obj ID, sel SEL, args ...uintptr) uint {
-	return msgSendUint(obj, sel, pointerArgs(args)...)
+	var buf [maxFrameArgs]objcArg
+	return msgSendUint(obj, sel, pointerArgs(args, &buf)...)
 }
 
 // MsgSendBool calls a method and returns a bool result.
 func MsgSendBool(obj ID, sel SEL, args ...uintptr) bool {
-	return msgSendBool(obj, sel, pointerArgs(args)...)
+	var buf [maxFrameArgs]objcArg
+	return msgSendBool(obj, sel, pointerArgs(args, &buf)...)
 }
 
 // Retain increments the reference count of an object.
