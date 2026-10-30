@@ -113,11 +113,11 @@ func (d *Device) MapBuffer(buffer hal.Buffer, offset, size uint64) (hal.BufferMa
 		buf.mapped = make([]byte, buf.size)
 
 		if buf.usage&gputypes.BufferUsageMapRead != 0 {
-			glCtx := d.ctx.Lock()
 			switch {
-			case len(buf.data) == int(buf.size):
+			case len(buf.data) == int(buf.size): // filled on the CPU side (CopyTextureToBuffer): no GL needed
 				copy(buf.mapped, buf.data)
 			case buf.id != 0:
+				glCtx := d.ctx.Lock()
 				glCtx.BindBuffer(gl.COPY_READ_BUFFER, buf.id)
 				glPtr := glCtx.MapBuffer(gl.COPY_READ_BUFFER, gl.READ_ONLY)
 				if glPtr != 0 {
@@ -127,8 +127,8 @@ func (d *Device) MapBuffer(buffer hal.Buffer, offset, size uint64) (hal.BufferMa
 					glCtx.UnmapBuffer(gl.COPY_READ_BUFFER)
 				}
 				glCtx.BindBuffer(gl.COPY_READ_BUFFER, 0)
+				d.ctx.Unlock()
 			}
-			d.ctx.Unlock()
 		}
 	}
 	return hal.BufferMapping{

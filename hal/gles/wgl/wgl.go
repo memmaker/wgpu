@@ -436,3 +436,11 @@ func (c *Context) HDC() HDC {
 func (c *Context) HGLRC() HGLRC {
 	return c.hglrc
 }
+
+var procGetCurrentThreadId = syscall.NewLazyDLL("kernel32.dll").NewProc("GetCurrentThreadId")
+
+// CurrentThreadID is the calling OS thread's id.
+func CurrentThreadID() uint32 {
+	r, _, _ := procGetCurrentThreadId.Call()
+	return uint32(r)
+}

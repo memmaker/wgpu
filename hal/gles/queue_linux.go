@@ -6,8 +6,10 @@
 package gles
 
 import (
+	"context"
 	"fmt"
 	"image"
+	"log/slog"
 	"unsafe"
 
 	"github.com/gogpu/gputypes"
@@ -31,6 +33,10 @@ func (q *Queue) Submit(commandBuffers []hal.CommandBuffer) (uint64, error) {
 	glCtx := q.ctx.Lock()
 	defer q.ctx.Unlock()
 
+	resetState() // GL state set outside Submit (writes, the present) is unknown to the cache
+	// glGetError after every command is a round trip into the driver each: only when debugging,
+	// otherwise once per submission
+	check := hal.Logger().Enabled(context.Background(), slog.LevelDebug)
 	for _, cb := range commandBuffers {
 		cmdBuf, ok := cb.(*CommandBuffer)
 		if !ok {
@@ -39,7 +45,11 @@ func (q *Queue) Submit(commandBuffers []hal.CommandBuffer) (uint64, error) {
 
 		// Execute recorded commands with GL error checking.
 		for i, cmd := range cmdBuf.commands {
+			forget()
 			cmd.Execute(glCtx)
+			if !check {
+				continue
+			}
 			if glErr := glCtx.GetError(); glErr != 0 {
 				detail := fmt.Sprintf("%T", cmd)
 				if vaoCmd, ok := cmd.(*BindVAOCommand); ok {
@@ -50,6 +60,11 @@ func (q *Queue) Submit(commandBuffers []hal.CommandBuffer) (uint64, error) {
 		}
 	}
 
+	if !check {
+		if glErr := glCtx.GetError(); glErr != 0 {
+			hal.Logger().Warn("gles: GL error in submission", "error", fmt.Sprintf("0x%x", glErr))
+		}
+	}
 	q.submissionIndex++
 
 	// Rust wgpu-hal queue.rs:1915-1921: fence.maintain → fence.signal → gl.flush.

@@ -34,6 +34,8 @@ type AdapterContext struct {
 	hglrc    wgl.HGLRC
 	hiddenDC wgl.HDC
 
+	renderTID uint32 // the thread that presents: it keeps the context current between locks (Unlock)
+
 	initOnce sync.Once
 	initErr  error
 }
@@ -99,6 +101,9 @@ func (c *AdapterContext) Lock() *gl.Context {
 		return c.gl
 	}
 
+	if wgl.GetCurrentContext() == c.hglrc && wgl.GetCurrentDC() == c.hiddenDC { // left current by this thread's last Unlock
+		return c.gl
+	}
 	if err := wgl.MakeCurrent(c.hiddenDC, c.hglrc); err != nil {
 		slog.Error("gles: AdapterContext.Lock MakeCurrent failed",
 			"err", err,
@@ -121,6 +126,10 @@ func (c *AdapterContext) LockForDC(hdc wgl.HDC) *gl.Context {
 		return c.gl
 	}
 
+	c.renderTID = wgl.CurrentThreadID()
+	if wgl.GetCurrentContext() == c.hglrc && wgl.GetCurrentDC() == hdc {
+		return c.gl
+	}
 	if err := wgl.MakeCurrent(hdc, c.hglrc); err != nil {
 		slog.Error("gles: AdapterContext.LockForDC MakeCurrent failed",
 			"err", err,
@@ -137,8 +146,21 @@ func (c *AdapterContext) LockForDC(hdc wgl.HDC) *gl.Context {
 // context is actually current on this thread. Matches Rust wgpu-hal
 // WglContext::unmake_current() which checks wglGetCurrentContext().is_invalid()
 // before unmaking (wgl.rs:128-133).
+//
+// The render thread (the one that presents) keeps the context current instead,
+// on the hidden DC (a window DC from GetDC is released after the present): on
+// some drivers (Windows 7's AMD) a wglMakeCurrent costs a quarter of a
+// millisecond, and a frame locks a dozen times. A context is current on one
+// thread at a time, so another thread locking after the first present would
+// fail; by then all GPU work is the render thread's.
 func (c *AdapterContext) Unlock() {
-	if wgl.GetCurrentContext() != 0 {
+	if c.renderTID != 0 && wgl.CurrentThreadID() == c.renderTID {
+		if wgl.GetCurrentContext() == c.hglrc && wgl.GetCurrentDC() != c.hiddenDC {
+			if err := wgl.MakeCurrent(c.hiddenDC, c.hglrc); err != nil {
+				slog.Error("gles: AdapterContext.Unlock MakeCurrent failed", "err", err)
+			}
+		}
+	} else if wgl.GetCurrentContext() != 0 {
 		if err := wgl.MakeCurrent(0, 0); err != nil {
 			slog.Error("gles: AdapterContext.Unlock UnmakeCurrent failed", "err", err)
 		}

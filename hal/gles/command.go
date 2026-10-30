@@ -8,6 +8,7 @@ package gles
 import (
 	"context"
 	"log/slog"
+	"math"
 	"unsafe"
 
 	"github.com/gogpu/gputypes"
@@ -839,6 +840,7 @@ type BindVAOCommand struct {
 }
 
 func (c *BindVAOCommand) Execute(ctx *gl.Context) {
+	st.hasVB, st.hasIB, st.vbBase = false, false, 0 // vertex attributes and the index buffer are the VAO's
 	ctx.BindVertexArray(c.vao)
 }
 
@@ -963,6 +965,7 @@ func (c *MSAAResolveCommand) Execute(ctx *gl.Context) {
 	// Disable scissor test before blit — glBlitFramebuffer respects GL_SCISSOR_TEST
 	// on the draw framebuffer. Without this, only the last scissor rect's pixels
 	// are copied, leaving the rest of the surface black (gg#226).
+	st.pipe, st.hasSC = nil, false // the scissor and the masks change
 	ctx.Disable(gl.SCISSOR_TEST)
 
 	// Bind MSAA FBO as read source.
@@ -1052,7 +1055,8 @@ type ClearColorBufferCommand struct {
 }
 
 func (c *ClearColorBufferCommand) Execute(ctx *gl.Context) {
-	ctx.Disable(gl.SCISSOR_TEST) // Ensure clear covers full framebuffer (not clipped by stale scissor)
+	st.pipe, st.hasSC = nil, false // the scissor and the masks change
+	ctx.Disable(gl.SCISSOR_TEST)   // Ensure clear covers full framebuffer (not clipped by stale scissor)
 	// Temporarily enable all color writes so the clear takes effect even if a
 	// previous pipeline masked some channels. Matches Rust behavior which
 	// sets color_mask(true,true,true,true) before clear (queue.rs:1134).
@@ -1068,7 +1072,8 @@ type ClearColorCommand struct {
 }
 
 func (c *ClearColorCommand) Execute(ctx *gl.Context) {
-	ctx.Disable(gl.SCISSOR_TEST) // Ensure clear covers full framebuffer (not clipped by stale scissor)
+	st.pipe, st.hasSC = nil, false // the scissor and the masks change
+	ctx.Disable(gl.SCISSOR_TEST)   // Ensure clear covers full framebuffer (not clipped by stale scissor)
 	ctx.ClearColor(c.r, c.g, c.b, c.a)
 	ctx.Clear(gl.COLOR_BUFFER_BIT)
 }
@@ -1079,6 +1084,7 @@ type ClearDepthCommand struct {
 }
 
 func (c *ClearDepthCommand) Execute(ctx *gl.Context) {
+	st.pipe, st.hasSC = nil, false // the scissor and the masks change
 	ctx.Disable(gl.SCISSOR_TEST)
 	ctx.DepthMask(true)
 	ctx.ClearDepth(c.depth)
@@ -1091,6 +1097,7 @@ type ClearStencilCommand struct {
 }
 
 func (c *ClearStencilCommand) Execute(ctx *gl.Context) {
+	st.pipe, st.hasSC = nil, false // the scissor and the masks change
 	ctx.Disable(gl.SCISSOR_TEST)
 	// Ensure stencil write mask allows the clear to take effect.
 	ctx.StencilMaskSeparate(gl.FRONT_AND_BACK, 0xFF)
@@ -1103,6 +1110,10 @@ type UseProgramCommand struct {
 }
 
 func (c *UseProgramCommand) Execute(ctx *gl.Context) {
+	if st.hasProgram && st.program == c.programID {
+		return
+	}
+	st.program, st.hasProgram = c.programID, true
 	ctx.UseProgram(c.programID)
 }
 
@@ -1117,6 +1128,10 @@ type SetPipelineStateCommand struct {
 }
 
 func (c *SetPipelineStateCommand) Execute(ctx *gl.Context) {
+	if st.pipe != nil && st.pipe.same(c) {
+		return
+	}
+	st.pipe = c
 	// Culling
 	if c.cullMode == gputypes.CullModeNone {
 		ctx.Disable(gl.CULL_FACE)
@@ -1287,6 +1302,13 @@ func (c *SetBindGroupCommand) Execute(ctx *gl.Context) {
 			target, dynOff := c.resolveBufferTarget(entry.Binding, &dynamicIdx)
 			offset += dynOff
 
+			b := uboBinding{target, bufID, offset, size, true}
+			if glBinding < uint32(len(st.ubo)) {
+				if st.ubo[glBinding] == b {
+					continue
+				}
+				st.ubo[glBinding] = b
+			}
 			if size > 0 {
 				ctx.BindBufferRange(target, glBinding, bufID, offset, size)
 			} else {
@@ -1313,7 +1335,13 @@ func (c *SetBindGroupCommand) Execute(ctx *gl.Context) {
 				}
 				continue
 			}
-			ctx.ActiveTexture(gl.TEXTURE0 + glBinding)
+			if glBinding < uint32(len(st.tex)) {
+				if st.tex[glBinding] == texID+1 {
+					continue
+				}
+				st.tex[glBinding] = texID + 1
+			}
+			activeTexture(ctx, glBinding)
 			ctx.BindTexture(gl.TEXTURE_2D, texID)
 
 		case gputypes.SamplerBinding:
@@ -1334,6 +1362,12 @@ func (c *SetBindGroupCommand) Execute(ctx *gl.Context) {
 					"textureUnit", bindUnit,
 					"samplerID", samplerID,
 				)
+			}
+			if bindUnit < uint32(len(st.samp)) {
+				if st.samp[bindUnit] == samplerID+1 {
+					continue
+				}
+				st.samp[bindUnit] = samplerID + 1
 			}
 			ctx.BindSampler(bindUnit, samplerID)
 		}
@@ -1404,6 +1438,41 @@ type SetVertexBufferCommand struct {
 }
 
 func (c *SetVertexBufferCommand) Execute(ctx *gl.Context) {
+	k := vbKey{c.buffer.id, c.offset, c.layout}
+	if c.slot != 0 {
+		st.multiSlot = true
+	}
+	if st.hasVB && st.vb == k {
+		st.vbBase = 0
+		return
+	}
+	// The same buffer and layout, a whole number of vertices on (a stream of small draws moves the
+	// offset for each): the attributes stay where they point and the draws add the vertices. A
+	// glVertexAttribPointer costs about what a draw does on some drivers, and a layout has several.
+	if st.hasVB && !st.multiSlot && st.vb.id == k.id && st.vb.layout == k.layout && c.layout != nil && c.layout.ArrayStride > 0 {
+		stride := int64(c.layout.ArrayStride)
+		if d := int64(c.offset) - int64(st.vb.offset); d >= 0 && d%stride == 0 && d/stride <= math.MaxInt32 {
+			st.vbBase, st.vbCmd = int32(d/stride), c
+			return
+		}
+	}
+	st.vb, st.hasVB, st.vbBase, st.vbCmd = k, true, 0, c
+	c.point(ctx)
+}
+
+// repoint sets the attributes at the vertex buffer's own offset, for a draw
+// that cannot add vbBase (an indexed one).
+func repoint(ctx *gl.Context) {
+	if st.vbBase == 0 || st.vbCmd == nil {
+		return
+	}
+	c := st.vbCmd
+	st.vb, st.vbBase = vbKey{c.buffer.id, c.offset, c.layout}, 0
+	c.point(ctx)
+}
+
+// point binds the buffer and sets the attributes to read it at the offset.
+func (c *SetVertexBufferCommand) point(ctx *gl.Context) {
 	ctx.BindBuffer(gl.ARRAY_BUFFER, c.buffer.id)
 
 	// Configure vertex attributes from the pipeline's vertex layout.
@@ -1438,6 +1507,10 @@ type SetIndexBufferCommand struct {
 }
 
 func (c *SetIndexBufferCommand) Execute(ctx *gl.Context) {
+	if st.hasIB && st.ib == c.buffer.id {
+		return
+	}
+	st.ib, st.hasIB = c.buffer.id, true
 	ctx.BindBuffer(gl.ELEMENT_ARRAY_BUFFER, c.buffer.id)
 }
 
@@ -1448,6 +1521,10 @@ type SetViewportCommand struct {
 }
 
 func (c *SetViewportCommand) Execute(ctx *gl.Context) {
+	if st.hasVP && st.vp == *c {
+		return
+	}
+	st.vp, st.hasVP = *c, true
 	ctx.Viewport(int32(c.x), int32(c.y), int32(c.width), int32(c.height))
 	ctx.DepthRange(float64(c.minDepth), float64(c.maxDepth))
 }
@@ -1462,6 +1539,10 @@ type SetScissorCommand struct {
 }
 
 func (c *SetScissorCommand) Execute(ctx *gl.Context) {
+	if st.hasSC && st.sc == *c {
+		return
+	}
+	st.sc, st.hasSC = *c, true
 	ctx.Enable(gl.SCISSOR_TEST)
 	// No Y-flip: ADJUST_COORDINATE_SPACE flips the scene in the vertex shader,
 	// so GL pixel Y=0 corresponds to the top of the scene (WebGPU Y=0).
@@ -1490,6 +1571,7 @@ func (c *SetStencilRefCommand) Execute(ctx *gl.Context) {
 	if c.depthStencil == nil {
 		return
 	}
+	st.pipe = nil // the stencil state is the pipeline's no more
 	ref := int32(c.ref)
 	ctx.StencilFuncSeparate(gl.FRONT,
 		compareFunctionToGL(c.depthStencil.StencilFront.Compare),
@@ -1508,10 +1590,11 @@ type DrawCommand struct {
 
 func (c *DrawCommand) Execute(ctx *gl.Context) {
 	mode := primitiveTopologyToGL(c.topology)
+	first := int32(c.firstVertex) + st.vbBase
 	if c.instanceCount <= 1 {
-		ctx.DrawArrays(mode, int32(c.firstVertex), int32(c.vertexCount))
+		ctx.DrawArrays(mode, first, int32(c.vertexCount))
 	} else {
-		ctx.DrawArraysInstanced(mode, int32(c.firstVertex), int32(c.vertexCount), int32(c.instanceCount))
+		ctx.DrawArraysInstanced(mode, first, int32(c.vertexCount), int32(c.instanceCount))
 	}
 }
 
@@ -1526,6 +1609,7 @@ type DrawIndexedCommand struct {
 }
 
 func (c *DrawIndexedCommand) Execute(ctx *gl.Context) {
+	repoint(ctx)
 	indexType := uint32(gl.UNSIGNED_SHORT)
 	indexSize := uintptr(2)
 	if c.indexFormat == gputypes.IndexFormatUint32 {
@@ -1613,6 +1697,9 @@ func (c *CopyTextureToBufferCommand) Execute(ctx *gl.Context) {
 	// Calculate byte sizes. Assume RGBA8 (4 bytes per pixel) for readback.
 	bpp := uint32(4)
 	rowBytes := uint32(width) * bpp
+	if c.bytesPerRow > rowBytes { // the caller's row pitch (wgpu pads rows to 256 bytes)
+		rowBytes = c.bytesPerRow
+	}
 	totalBytes := uint64(rowBytes) * uint64(height)
 
 	// Ensure destination buffer has enough CPU-side storage.
@@ -1646,25 +1733,18 @@ func (c *CopyTextureToBufferCommand) Execute(ctx *gl.Context) {
 	// Set tight pixel packing (no row alignment padding).
 	ctx.PixelStorei(gl.PACK_ALIGNMENT, 1)
 
-	// Read pixels from the bound FBO into a temporary CPU buffer.
-	tmpBuf := make([]byte, totalBytes)
+	// Read the pixels straight into the destination buffer's CPU-side storage, in
+	// the texture's own component order and row order: a texture's row 0 is row 0
+	// (only the default framebuffer is bottom-up).
+	_, format, dataType := textureFormatToGL(c.srcTexture.format)
+	ctx.PixelStorei(gl.PACK_ROW_LENGTH, int32(rowBytes/bpp))
 	ctx.ReadPixels(
 		int32(c.srcOrigin[0]), int32(c.srcOrigin[1]),
 		width, height,
-		gl.BGRA, gl.UNSIGNED_BYTE,
-		unsafe.Pointer(&tmpBuf[0]),
+		format, dataType,
+		unsafe.Pointer(&c.dstBuffer.data[c.dstOffset]),
 	)
-
-	// Copy the pixel data into the destination buffer's CPU-side storage.
-	// OpenGL reads bottom-to-top, but callers expect top-to-bottom order.
-	// Flip the rows during copy.
-	for row := int32(0); row < height; row++ {
-		// OpenGL row 0 = bottom. We want row 0 = top.
-		srcRow := (height - 1 - row)
-		srcStart := uint64(srcRow) * uint64(rowBytes)
-		dstStart := c.dstOffset + uint64(row)*uint64(rowBytes)
-		copy(c.dstBuffer.data[dstStart:dstStart+uint64(rowBytes)], tmpBuf[srcStart:srcStart+uint64(rowBytes)])
-	}
+	ctx.PixelStorei(gl.PACK_ROW_LENGTH, 0)
 
 	// Restore the previous FBO binding.
 	ctx.BindFramebuffer(gl.FRAMEBUFFER, uint32(prevFBO))
@@ -1683,6 +1763,7 @@ type CopyBufferToTextureCommand struct {
 }
 
 func (c *CopyBufferToTextureCommand) Execute(ctx *gl.Context) {
+	st.forgetTextures()
 	width := int32(c.copySize[0])
 	height := int32(c.copySize[1])
 	if width == 0 || height == 0 {
@@ -1713,6 +1794,7 @@ func (c *CopyBufferToTextureCommand) Execute(ctx *gl.Context) {
 	ctx.PixelStorei(gl.UNPACK_ALIGNMENT, 4)
 	ctx.BindBuffer(gl.PIXEL_UNPACK_BUFFER, 0)
 	ctx.BindTexture(c.dstTex.target, 0)
+	untrackTexture()
 }
 
 // CopyTextureToTextureCommand copies pixels between textures using an FBO.
@@ -1730,6 +1812,7 @@ type CopyTextureToTextureCommand struct {
 }
 
 func (c *CopyTextureToTextureCommand) Execute(ctx *gl.Context) {
+	st.forgetTextures()
 	width := int32(c.copySize[0])
 	height := int32(c.copySize[1])
 	if width == 0 || height == 0 {
@@ -1753,6 +1836,7 @@ func (c *CopyTextureToTextureCommand) Execute(ctx *gl.Context) {
 		int32(c.srcOrigin[0]), int32(c.srcOrigin[1]),
 		width, height)
 	ctx.BindTexture(c.dstTex.target, 0)
+	untrackTexture()
 
 	// Clean up temporary FBO.
 	ctx.DeleteFramebuffers(readFBO)

@@ -354,4 +354,5 @@ const (
 
 	// Pixel storage (GL 3.0+ / ES 3.0+)
 	UNPACK_ROW_LENGTH = 0x0CF2
+	PACK_ROW_LENGTH   = 0x0D02
 )
