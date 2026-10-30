@@ -37,7 +37,7 @@ var (
 // takes no lock and allocates nothing (a sync.Map boxes the string key).
 var (
 	selectors   atomic.Pointer[map[string]SEL]
-	selectorsMu sync.Mutex // serialises inserts
+	selectorsMu sync.Mutex // serializes inserts
 )
 
 // objcArg is one argument of an Objective-C call, its value held inline so
@@ -213,22 +213,18 @@ func RegisterSelector(name string) SEL {
 	_, _ = ffi.CallFunction(&cifSelRegister, symSelRegisterName, unsafe.Pointer(&result), args[:])
 
 	selectorsMu.Lock()
-	old := selectors.Load()
-	m := make(map[string]SEL, 1+len(mapOrEmpty(old)))
-	for k, v := range mapOrEmpty(old) {
+	var old map[string]SEL
+	if p := selectors.Load(); p != nil {
+		old = *p
+	}
+	m := make(map[string]SEL, 1+len(old))
+	for k, v := range old {
 		m[k] = v
 	}
 	m[name] = result
 	selectors.Store(&m)
 	selectorsMu.Unlock()
 	return result
-}
-
-func mapOrEmpty(m *map[string]SEL) map[string]SEL {
-	if m == nil {
-		return nil
-	}
-	return *m
 }
 
 // Sel is a convenience alias for RegisterSelector.

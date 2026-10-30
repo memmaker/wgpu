@@ -66,7 +66,7 @@ func drawQuad(t *testing.T, firstIndex uint32, baseVertex int32) int {
 	defer device.Release()
 	q := device.Queue()
 
-	var verts []float32
+	verts := make([]float32, 0, 2*baseVertex+8)
 	for range baseVertex {
 		verts = append(verts, 0.5, 0.5)
 	}
@@ -76,16 +76,16 @@ func drawQuad(t *testing.T, firstIndex uint32, baseVertex int32) int {
 		binary.LittleEndian.PutUint32(vbytes[4*i:], math.Float32bits(f))
 	}
 	indices := append(make([]uint16, firstIndex), 0, 1, 2, 2, 3, 0)
-	ibytes := make([]byte, 2*len(indices))
+	ibytes := make([]byte, (2*len(indices)+3)&^3) // padded to the 4 bytes WriteBuffer wants
 	for i, v := range indices {
 		binary.LittleEndian.PutUint16(ibytes[2*i:], v)
 	}
 	vbuf, _ := device.CreateBuffer(&wgpu.BufferDescriptor{Size: uint64(len(vbytes)), Usage: gputypes.BufferUsageVertex | gputypes.BufferUsageCopyDst})
 	defer vbuf.Release()
 	q.WriteBuffer(vbuf, 0, vbytes)
-	ibuf, _ := device.CreateBuffer(&wgpu.BufferDescriptor{Size: uint64((len(ibytes) + 3) &^ 3), Usage: gputypes.BufferUsageIndex | gputypes.BufferUsageCopyDst})
+	ibuf, _ := device.CreateBuffer(&wgpu.BufferDescriptor{Size: uint64(len(ibytes)), Usage: gputypes.BufferUsageIndex | gputypes.BufferUsageCopyDst})
 	defer ibuf.Release()
-	q.WriteBuffer(ibuf, 0, append(ibytes, make([]byte, (4-len(ibytes)%4)%4)...))
+	q.WriteBuffer(ibuf, 0, ibytes)
 
 	shader, err := device.CreateShaderModule(&wgpu.ShaderModuleDescriptor{WGSL: quadShader})
 	if err != nil {

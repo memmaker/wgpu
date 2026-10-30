@@ -315,7 +315,7 @@ func writeImage(outputPath string, pixels []byte, bytesPerRow uint32) error {
 	if err := png.Encode(&buf, img); err != nil {
 		return fmt.Errorf("encode png: %w", err)
 	}
-	if err := os.WriteFile(outputPath, buf.Bytes(), 0o600); err != nil {
+	if err := os.WriteFile(outputPath, buf.Bytes(), 0o600); err != nil { //nolint:gosec // the output path is the user's own argument
 		return fmt.Errorf("write png: %w", err)
 	}
 	fmt.Printf("PNG written: %s (%d bytes)\n", outputPath, buf.Len())

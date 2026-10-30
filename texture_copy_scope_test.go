@@ -459,13 +459,6 @@ func createCopyScopeBuffer(t *testing.T, device *Device, label string) *Buffer {
 	return buffer
 }
 
-func mustSetTextureScopeUsage(t *testing.T, enc *CommandEncoder, texture *Texture, usage track.TextureUses) {
-	t.Helper()
-	if err := enc.core.Mutable().TextureScope().SetUsage(texture.coreTexture.TrackingData().Index(), usage); err != nil {
-		t.Fatalf("seed texture scope: %v", err)
-	}
-}
-
 func mustSetBufferScopeUsage(t *testing.T, enc *CommandEncoder, buffer *Buffer, usage track.BufferUses) {
 	t.Helper()
 	if err := enc.core.Mutable().BufferScope().SetUsage(buffer.core.TrackingData().Index(), usage); err != nil {
