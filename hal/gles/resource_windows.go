@@ -7,6 +7,7 @@ package gles
 
 import (
 	"fmt"
+	"log/slog"
 
 	"github.com/gogpu/gputypes"
 	"github.com/gogpu/wgpu/hal"
@@ -98,6 +99,9 @@ func (s *Surface) Configure(_ hal.Device, config *hal.SurfaceConfiguration) erro
 	if hdc != 0 {
 		s.ctx.LockForDC(hdc)
 		wgl.LoadExtensions(hdc)
+		if !wgl.HasSwapControl() {
+			slog.Warn("gles: no wglSwapIntervalEXT: the present mode has no effect")
+		}
 		if wgl.HasSwapControl() {
 			var interval int
 			switch config.PresentMode {
@@ -108,7 +112,8 @@ func (s *Surface) Configure(_ hal.Device, config *hal.SurfaceConfiguration) erro
 			default:
 				interval = 1
 			}
-			_ = wgl.SetSwapInterval(interval)
+			err := wgl.SetSwapInterval(interval)
+			slog.Info("gles: swap interval", "interval", interval, "err", err)
 		}
 		s.ctx.Unlock()
 		wgl.ReleaseDC(s.hwnd, hdc)

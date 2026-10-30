@@ -8,7 +8,6 @@ package wgl
 
 import (
 	"fmt"
-	"strings"
 	"syscall"
 	"unsafe"
 )
@@ -316,10 +315,12 @@ func LoadExtensions(hdc HDC) {
 	procSwapIntervalEXT = GetProcAddress("wglSwapIntervalEXT")
 	procGetExtensionsARB = GetProcAddress("wglGetExtensionsStringARB")
 
-	// Check extension availability via extension string
-	ext := getExtensionsString(hdc)
-	swapControlAvailable = strings.Contains(ext, "WGL_EXT_swap_control") &&
-		procSwapIntervalEXT != 0
+	// The function's address is proof enough: some drivers give no extension
+	// string for a window's DC (AMD on Windows 7), yet wglSwapIntervalEXT works.
+	swapControlAvailable = procSwapIntervalEXT != 0
+	if !swapControlAvailable {
+		extensionsLoaded = false // try again with the next context
+	}
 }
 
 // getExtensionsString queries WGL extension string via wglGetExtensionsStringARB.
