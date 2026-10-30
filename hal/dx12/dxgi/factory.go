@@ -52,6 +52,9 @@ func loadDXGIInternal() (*DXGILib, error) {
 
 // CreateFactory1 creates a DXGI factory (IDXGIFactory1).
 func (lib *DXGILib) CreateFactory1() (*IDXGIFactory1, error) {
+	if err := lib.createDXGIFactory1.Find(); err != nil { // LazyProc.Call would panic
+		return nil, err
+	}
 	var factory *IDXGIFactory1
 
 	ret, _, _ := lib.createDXGIFactory1.Call(
@@ -68,6 +71,9 @@ func (lib *DXGILib) CreateFactory1() (*IDXGIFactory1, error) {
 // CreateFactory2 creates a DXGI factory with debug flags (IDXGIFactory6).
 // Use DXGI_CREATE_FACTORY_DEBUG for debug mode.
 func (lib *DXGILib) CreateFactory2(flags uint32) (*IDXGIFactory6, error) {
+	if err := lib.createDXGIFactory2.Find(); err != nil { // Windows 8.1+; before it, LazyProc.Call would panic
+		return nil, err
+	}
 	var factory *IDXGIFactory6
 
 	ret, _, _ := lib.createDXGIFactory2.Call(
